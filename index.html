@@ -1,0 +1,447 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1.0">
+<title>2048</title>
+<!--
+  Standalone port of 2048.c (single file, opens directly in any browser).
+  2048.c is a web server (port 8080); this file embeds the exact same game
+  logic and UI, with its endpoints mapped to local calls:
+    GET  /            -> this page
+    GET  /state       -> fetchState()
+    POST /move?dir=X  -> move('left'|'right'|'up'|'down')
+    POST /undo        -> undo()          (MAX_UNDO = 3)
+    POST /save        -> saveGame()      (localStorage + 2048_save.dat download)
+    POST /new         -> newGame()
+    Upload button     -> uploadGame()    (open a 2048_save.dat file, layout of 2048.c)
+    POST /exit        -> exitGame()      ("Goodbye!" page, as on server shutdown)
+-->
+<style>
+*{margin:0;padding:0;box-sizing:border-box}
+body{font-family:Arial,sans-serif;background:#faf8ef;display:flex;justify-content:center;align-items:center;min-height:100vh}
+#app{width:500px;padding:20px}
+#head{display:flex;justify-content:space-between;align-items:center;margin-bottom:20px}
+h1{font-size:48px;color:#776e65}
+#scbox{background:#bbada0;padding:8px 20px;border-radius:6px;color:#fff;text-align:center;font-weight:bold}
+#scbox div:first-child{font-size:13px;text-transform:uppercase}
+#score{font-size:28px}
+#board{background:#bbada0;border-radius:6px;padding:8px;display:grid;grid-template-columns:repeat(4,1fr);gap:8px}
+.cell{aspect-ratio:1;background:rgba(238,228,218,0.35);border-radius:4px;display:flex;justify-content:center;align-items:center;font-size:40px;font-weight:bold;color:#776e65;transition:all .1s}
+.tile-2{background:#eee4da}.tile-4{background:#ede0c8}
+.tile-8{background:#f2b179;color:#f9f6f2}.tile-16{background:#f59563;color:#f9f6f2}
+.tile-32{background:#f67c5f;color:#f9f6f2}.tile-64{background:#f65e3b;color:#f9f6f2}
+.tile-128{background:#edcf72;color:#f9f6f2}.tile-256{background:#edcc61;color:#f9f6f2}
+.tile-512{background:#edc850;color:#f9f6f2}.tile-1024{background:#edc53f;color:#f9f6f2}
+.tile-2048{background:#edc22e;color:#f9f6f2}.tile-super{background:#3c3a32;color:#f9f6f2}
+#btns{margin-top:16px;display:flex;gap:8px;flex-wrap:wrap}
+#btns button{padding:12px 20px;font-size:15px;font-weight:bold;border:none;border-radius:6px;cursor:pointer;background:#8f7a66;color:#fff;flex:1;min-width:80px;transition:background .15s}
+#btns button:hover{background:#9f8b76}
+#btns button:active{background:#7a6658}
+#msg{margin-top:14px;font-size:22px;font-weight:bold;text-align:center;color:#776e65;min-height:30px}
+</style>
+</head>
+<body>
+<div id="app">
+<div id="head"><h1>2048</h1><div id="scbox"><div>Score</div><span id="score">0</span></div></div>
+<div id="board"></div>
+<div id="btns">
+<button onclick="newGame()">New Game</button>
+<button onclick="undo()">Undo</button>
+<button onclick="saveGame()">Save</button>
+<button onclick="uploadGame()">Upload</button>
+<button onclick="exitGame()">Exit</button>
+<input type="file" id="datfile" accept=".dat" style="display:none" onchange="onFileSelected(this)">
+</div>
+<div id="msg"></div>
+</div>
+<script>
+/* ==========================================================
+ * Server-side game logic of 2048.c, ported 1:1
+ * (add_tile / init_game / slide_row / moves / try_move /
+ *  do_undo / save_game / load_game / json_state)
+ * ========================================================== */
+var N = 4;
+var MAX_UNDO = 3;
+var SAVE_KEY = "2048_save";   /* localStorage key, replaces 2048_save.dat */
+
+/* Game: board 4x4 (0 = empty), score, over, won, undo history */
+var state;
+
+function zeroBoard() {
+    var b = [];
+    for (var i = 0; i < N; i++) b.push([0, 0, 0, 0]);
+    return b;
+}
+
+function copyBoard(b) {
+    var c = [];
+    for (var i = 0; i < N; i++) c.push(b[i].slice());
+    return c;
+}
+
+/* add_tile: new tile in a random empty cell, 90% -> 2, 10% -> 4 */
+function addTile(b) {
+    var empty = [], cnt = 0;
+    for (var i = 0; i < N; i++)
+        for (var j = 0; j < N; j++)
+            if (b[i][j] === 0) empty[cnt++] = [i, j];
+    if (cnt === 0) return;
+    var idx = Math.floor(Math.random() * cnt);
+    b[empty[idx][0]][empty[idx][1]] = (Math.random() * 10 < 9) ? 2 : 4;
+}
+
+/* init_game: empty board, score 0, two tiles */
+function initGame() {
+    state = { board: zeroBoard(), score: 0, over: false, won: false,
+              hist: [null, null, null], hc: 0 };
+    addTile(state.board);
+    addTile(state.board);
+}
+
+/* slide one row left, return merge score (each tile merges at most once) */
+function slideRow(row) {
+    var compact = [], cpos = 0;
+    for (var i = 0; i < N; i++)
+        if (row[i] !== 0) compact[cpos++] = row[i];
+
+    var merged = [], mpos = 0, score = 0;
+    for (i = 0; i < cpos; i++) {
+        if (i + 1 < cpos && compact[i] === compact[i + 1]) {
+            merged[mpos] = compact[i] * 2;
+            score += merged[mpos];
+            i++; /* skip paired tile */
+        } else {
+            merged[mpos] = compact[i];
+        }
+        mpos++;
+    }
+
+    for (var j = 0; j < N; j++) row[j] = j < mpos ? merged[j] : 0;
+    return score;
+}
+
+function revRow(row) {
+    for (var i = 0; i < N / 2; i++) {
+        var t = row[i]; row[i] = row[N - 1 - i]; row[N - 1 - i] = t;
+    }
+}
+
+function transpose(b) {
+    for (var i = 0; i < N; i++)
+        for (var j = i + 1; j < N; j++) {
+            var t = b[i][j]; b[i][j] = b[j][i]; b[j][i] = t;
+        }
+}
+
+/* move_left / move_right / move_up / move_down: total merge score */
+function moveLeft() {
+    var s = 0;
+    for (var i = 0; i < N; i++) s += slideRow(state.board[i]);
+    return s;
+}
+
+function moveRight() {
+    var s = 0;
+    for (var i = 0; i < N; i++) { revRow(state.board[i]); s += slideRow(state.board[i]); revRow(state.board[i]); }
+    return s;
+}
+
+function moveUp() {
+    transpose(state.board); var s = moveLeft(); transpose(state.board); return s;
+}
+
+function moveDown() {
+    transpose(state.board); var s = moveRight(); transpose(state.board); return s;
+}
+
+function boardEq(a, b) {
+    for (var i = 0; i < N; i++)
+        for (var j = 0; j < N; j++)
+            if (a[i][j] !== b[i][j]) return false;
+    return true;
+}
+
+/* try_move: apply move, save undo snapshot, add tile, check win/over */
+function tryMove(dir) {
+    var old = copyBoard(state.board);
+    var oldSc = state.score;
+    var gain;
+
+    if      (dir === "left")  gain = moveLeft();
+    else if (dir === "right") gain = moveRight();
+    else if (dir === "up")    gain = moveUp();
+    else if (dir === "down")  gain = moveDown();
+    else return false;
+
+    if (boardEq(state.board, old)) return false;
+
+    /* save undo snapshot (ring of MAX_UNDO, oldest dropped) */
+    if (state.hc < MAX_UNDO) {
+        state.hist[state.hc] = { board: old, score: oldSc };
+        state.hc++;
+    } else {
+        for (var i = 0; i < MAX_UNDO - 1; i++) state.hist[i] = state.hist[i + 1];
+        state.hist[MAX_UNDO - 1] = { board: old, score: oldSc };
+    }
+
+    state.score += gain;
+    addTile(state.board);
+
+    /* check win */
+    if (!state.won)
+        for (var r = 0; r < N && !state.won; r++)
+            for (var c = 0; c < N && !state.won; c++)
+                if (state.board[r][c] >= 2048) state.won = true;
+
+    /* check game over */
+    state.over = true;
+    for (r = 0; r < N && state.over; r++)
+        for (c = 0; c < N && state.over; c++) {
+            if (state.board[r][c] === 0)                            state.over = false;
+            if (c + 1 < N && state.board[r][c] === state.board[r][c + 1]) state.over = false;
+            if (r + 1 < N && state.board[r][c] === state.board[r + 1][c]) state.over = false;
+        }
+
+    return true;
+}
+
+/* do_undo: restore last snapshot (board, score, over); won is kept */
+function doUndo() {
+    if (state.hc === 0) return false;
+    state.hc--;
+    state.board = copyBoard(state.hist[state.hc].board);
+    state.score = state.hist[state.hc].score;
+    state.over = false;
+    return true;
+}
+
+/* save_game -> localStorage (binary 2048_save.dat equivalent) */
+function saveState() {
+    try {
+        var o = { board: copyBoard(state.board), score: state.score,
+                  over: state.over, won: state.won, hist: [], hc: state.hc };
+        for (var i = 0; i < MAX_UNDO; i++)
+            o.hist[i] = state.hist[i]
+                ? { board: copyBoard(state.hist[i].board), score: state.hist[i].score }
+                : null;
+        localStorage.setItem(SAVE_KEY, JSON.stringify(o));
+        return true;
+    } catch (e) { return false; }
+}
+
+/* load_game -> localStorage */
+function loadState() {
+    try {
+        var raw = localStorage.getItem(SAVE_KEY);
+        if (raw === null) return false;
+        var o = JSON.parse(raw);
+        if (!o || !Array.isArray(o.board) || o.board.length !== N) return false;
+        for (var i = 0; i < N; i++)
+            if (!Array.isArray(o.board[i]) || o.board[i].length !== N) return false;
+        var board = copyBoard(o.board);
+        var hc = Math.max(0, Math.min(MAX_UNDO, o.hc | 0));
+        var hist = [];
+        for (var h = 0; h < MAX_UNDO; h++) {
+            var s = o.hist && o.hist[h];
+            var ok = s && Array.isArray(s.board) && s.board.length === N;
+            for (var k = 0; ok && k < N; k++)
+                if (!Array.isArray(s.board[k]) || s.board[k].length !== N) ok = false;
+            hist[h] = ok ? { board: copyBoard(s.board), score: s.score | 0 } : null;
+        }
+        state = { board: board, score: o.score | 0,
+                  over: !!o.over, won: !!o.won, hist: hist, hc: hc };
+        return true;
+    } catch (e) { return false; }
+}
+
+/* json_state: same JSON shape the server sent */
+function jsonState(msg) {
+    return {
+        board: copyBoard(state.board),
+        score: state.score,
+        gameover: state.over,
+        won: state.won,
+        undocount: state.hc,
+        message: msg || ""
+    };
+}
+
+/* ==========================================================
+ * Frontend — the page embedded in 2048.c, with its XHR calls
+ * to /state, /move, /undo, /save, /new, /exit replaced by the
+ * local calls above (identical behavior and messages).
+ * ========================================================== */
+function render(d) {
+    var b = document.getElementById('board'); b.innerHTML = '';
+    for (var i = 0; i < 4; i++) for (var j = 0; j < 4; j++) {
+        var c = document.createElement('div'); c.className = 'cell';
+        var v = d.board[i][j];
+        if (v > 0) {
+            c.textContent = v;
+            if (v <= 2048) c.classList.add('tile-' + v); else c.classList.add('tile-super');
+            if (v < 100) c.style.fontSize = '40px';
+            else if (v < 1000) c.style.fontSize = '32px';
+            else if (v < 10000) c.style.fontSize = '24px';
+            else c.style.fontSize = '18px';
+        }
+        b.appendChild(c);
+    }
+    document.getElementById('score').textContent = d.score;
+    var m = document.getElementById('msg');
+    if (d.gameover) m.textContent = 'Game Over!';
+    else if (d.won) m.textContent = 'You Win!';
+    else m.textContent = '';
+}
+
+function fetchState() { render(jsonState("")); }
+
+function move(d) { tryMove(d); render(jsonState("")); }
+
+function undo() {
+    var msg = doUndo() ? "Undo successful" : "No moves to undo";
+    render(jsonState(msg));
+}
+
+function saveGame() {
+    var ok = saveState();
+    if (ok) downloadDat();
+    document.getElementById('msg').textContent = ok ? "Game saved" : "Save failed";
+}
+
+/* ==========================================================
+ * 2048_save.dat binary layout — identical to 2048.c:
+ *   board (4x4 x int32 LE) | score int32 | over int32 |
+ *   won int32 | 3 x (board + score) | hc int32   = 284 bytes
+ * ========================================================== */
+var DAT_SIZE = N * N * 4 + 3 * 4 + MAX_UNDO * (N * N * 4 + 4) + 4; /* 284 */
+
+function boardBytes(dv, off, b) {
+    for (var i = 0; i < N; i++)
+        for (var j = 0; j < N; j++) dv.setInt32(off + (i * N + j) * 4, b[i][j], true);
+}
+
+function readBoard(dv, off) {
+    var b = [];
+    for (var i = 0; i < N; i++) {
+        b.push([]);
+        for (var j = 0; j < N; j++) b[i].push(dv.getInt32(off + (i * N + j) * 4, true));
+    }
+    return b;
+}
+
+function serializeDat() {
+    var buf = new ArrayBuffer(DAT_SIZE);
+    var dv = new DataView(buf);
+    var off = 0;
+    boardBytes(dv, off, state.board); off += N * N * 4;
+    dv.setInt32(off, state.score, true); off += 4;
+    dv.setInt32(off, state.over ? 1 : 0, true); off += 4;
+    dv.setInt32(off, state.won ? 1 : 0, true); off += 4;
+    for (var i = 0; i < MAX_UNDO; i++) {
+        if (state.hist[i]) {
+            boardBytes(dv, off, state.hist[i].board); off += N * N * 4;
+            dv.setInt32(off, state.hist[i].score, true); off += 4;
+        } else {
+            off += N * N * 4 + 4; /* zero-filled, as in an unwritten save */
+        }
+    }
+    dv.setInt32(off, state.hc, true);
+    return buf;
+}
+
+function downloadDat() {
+    try {
+        var blob = new Blob([serializeDat()], { type: "application/octet-stream" });
+        var a = document.createElement('a');
+        a.href = URL.createObjectURL(blob);
+        a.download = "2048_save.dat";
+        document.body.appendChild(a);
+        a.click();
+        a.remove();
+        setTimeout(function () { URL.revokeObjectURL(a.href); }, 1000);
+    } catch (e) { return false; }
+    return true;
+}
+
+function parseDat(buf) {
+    var dv = new DataView(buf);
+    var off = 0;
+    var board = readBoard(dv, off); off += N * N * 4;
+    var score = dv.getInt32(off, true); off += 4;
+    var over = dv.getInt32(off, true); off += 4;
+    var won = dv.getInt32(off, true); off += 4;
+    var hist = [];
+    for (var i = 0; i < MAX_UNDO; i++) {
+        var hb = readBoard(dv, off); off += N * N * 4;
+        var hs = dv.getInt32(off, true); off += 4;
+        hist.push({ board: hb, score: hs });
+    }
+    var hc = dv.getInt32(off, true);
+    return { board: board, score: score, over: over, won: won, hist: hist, hc: hc };
+}
+
+/* Upload: confirm overwrite when the current score is not 0 */
+function uploadGame() {
+    var curScore = 0;
+    if (state) try { curScore = parseInt(document.getElementById('score').textContent, 10) || 0; } catch (e) { curScore = 0; }
+    if (curScore !== 0 && !confirm("Current score is " + curScore +
+            ". Upload will overwrite the current game. Continue?")) return;
+    document.getElementById('datfile').click();
+}
+
+function onFileSelected(input) {
+    var file = input.files && input.files[0];
+    input.value = ""; /* same file can be re-selected again */
+    if (!file) return;
+    var r = new FileReader();
+    r.onload = function () {
+        try {
+            if (r.result.byteLength !== DAT_SIZE) throw new Error("bad size");
+            var d = parseDat(r.result);
+            if (d.board.some(function (row) { return row.some(function (v) {
+                return v !== 0 && (v <= 0 || (v & 1) !== 0);
+            }); }) || d.score < 0 || !isFinite(d.hc) || d.hc < 0 || d.hc > MAX_UNDO)
+                throw new Error("bad data");
+            var clamped = Math.max(0, Math.min(MAX_UNDO, d.hc));
+            while (d.hc > clamped) d.hc--;
+            var hist = [];
+            for (var h = 0; h < MAX_UNDO; h++)
+                hist.push(h < d.hc ? { board: d.hist[h].board, score: d.hist[h].score } : null);
+            state = { board: d.board, score: d.score, over: !!d.over, won: !!d.won,
+                      hist: hist, hc: d.hc };
+            render(jsonState("Loaded saved game from " + file.name));
+        } catch (e) {
+            /* failed to open: keep the current game untouched */
+            render(jsonState("Failed to open " + file.name + ": invalid DAT file"));
+        }
+    };
+    r.onerror = function () { render(jsonState("Failed to open " + file.name + ": cannot read file")); };
+    r.readAsArrayBuffer(file);
+}
+
+function newGame() {
+    initGame();
+    render(jsonState("New game started"));
+}
+
+function exitGame() {
+    document.getElementById('msg').textContent = "Server shutting down";
+    document.body.innerHTML = '<div style="text-align:center;margin-top:100px;font-size:36px;color:#776e65">Goodbye!</div>';
+}
+
+document.addEventListener('keydown', function (e) {
+    var k = e.key;
+    if (k == 'ArrowUp' || k == 'w' || k == 'W') { e.preventDefault(); move('up'); }
+    else if (k == 'ArrowDown' || k == 's' || k == 'S') { e.preventDefault(); move('down'); }
+    else if (k == 'ArrowLeft' || k == 'a' || k == 'A') { e.preventDefault(); move('left'); }
+    else if (k == 'ArrowRight' || k == 'd' || k == 'D') { e.preventDefault(); move('right'); }
+});
+
+/* main(): start a game, then load the saved one if present */
+initGame();
+if (loadState()) { /* "Loaded saved game from 2048_save.dat" */ }
+fetchState();
+</script>
+</body>
+</html>
